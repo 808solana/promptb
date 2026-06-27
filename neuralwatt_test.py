@@ -64,18 +64,21 @@ HTML = """
     h1 { color: #ff6b35; }
     h2 { color: #aaa; font-size: 14px; margin-top: 30px; }
     textarea { width: 100%; height: 100px; background: #1a1a1a; color: #e0e0e0; border: 1px solid #333; padding: 10px; font-family: monospace; font-size: 13px; resize: vertical; }
-    button { background: #ff6b35; color: white; border: none; padding: 10px 24px; cursor: pointer; font-size: 14px; margin-top: 8px; }
+    .btn-row { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
+    button { background: #ff6b35; color: white; border: none; padding: 10px 24px; cursor: pointer; font-size: 14px; }
     button:hover { background: #e55a25; }
-    .response { background: #1a1a1a; border: 1px solid #333; padding: 16px; margin-top: 16px; white-space: pre-wrap; font-size: 13px; }
-    .stats-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-top: 16px; }
+    .done-indicator { display: none; color: #4caf50; font-size: 20px; }
+    .response { background: #1a1a1a; border: 1px solid #333; margin-top: 16px; font-size: 13px; overflow: hidden; }
+    .response-header { display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; cursor: pointer; user-select: none; }
+    .response-header:hover { background: #222; }
+    .response-header .arrow { color: #888; font-size: 12px; transition: transform 0.2s; }
+    .response-header .arrow.open { transform: rotate(90deg); }
+    .response-body { display: none; padding: 0 14px 14px; white-space: pre-wrap; }
+    .response-body.open { display: block; }
+    .stats-grid { display: flex; justify-content: center; margin-top: 16px; }
     .stat-box { background: #1a1a1a; border: 1px solid #333; padding: 14px; text-align: center; }
     .stat-value { font-size: 22px; color: #ff6b35; font-weight: bold; }
     .stat-label { font-size: 11px; color: #888; margin-top: 4px; }
-    .history { margin-top: 20px; }
-    .history-row { border-bottom: 1px solid #222; padding: 8px 0; font-size: 12px; color: #aaa; }
-    .pill { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; margin-left: 6px; }
-    .green { background: #1a3a1a; color: #4caf50; }
-    .orange { background: #3a2a1a; color: #ff9800; }
     #loading { display: none; color: #ff6b35; margin-top: 8px; }
   </style>
 </head>
@@ -86,10 +89,19 @@ HTML = """
   <h2>SEND A REQUEST</h2>
   <textarea id="prompt" placeholder="Type your prompt here..."></textarea>
   <br/>
-  <button onclick="sendRequest()">Send Request →</button>
+  <div class="btn-row">
+    <button onclick="sendRequest()">Send Request →</button>
+    <span class="done-indicator" id="done-indicator">&#10003;</span>
+  </div>
   <div id="loading">⏳ Waiting for response...</div>
 
-  <div id="response-box" class="response" style="display:none"></div>
+  <div id="response-box" class="response" style="display:none">
+    <div class="response-header" onclick="toggleResponse()">
+      <span>AI Response</span>
+      <span class="arrow" id="response-arrow">&#9654;</span>
+    </div>
+    <div class="response-body" id="response-body"></div>
+  </div>
 
   <h2>SESSION STATS</h2>
   <div class="stats-grid">
@@ -97,37 +109,22 @@ HTML = """
       <div class="stat-value" id="s-requests">0</div>
       <div class="stat-label">Total Requests</div>
     </div>
-    <div class="stat-box">
-      <div class="stat-value" id="s-tokens">0</div>
-      <div class="stat-label">Total Tokens</div>
-    </div>
-    <div class="stat-box">
-      <div class="stat-value" id="s-cost">$0.00</div>
-      <div class="stat-label">Total Cost (USD)</div>
-    </div>
-    <div class="stat-box">
-      <div class="stat-value" id="s-energy">0 Wh</div>
-      <div class="stat-label">Energy Consumed</div>
-    </div>
-    <div class="stat-box">
-      <div class="stat-value" id="s-cpm">—</div>
-      <div class="stat-label">Effective Cost / 1M Tokens</div>
-    </div>
-    <div class="stat-box">
-      <div class="stat-value" id="s-savings">—</div>
-      <div class="stat-label">vs $5.00/M Token Rate</div>
-    </div>
   </div>
 
-  <h2>REQUEST HISTORY</h2>
-  <div id="history" class="history"></div>
-
   <script>
+    function toggleResponse() {
+      const body = document.getElementById('response-body');
+      const arrow = document.getElementById('response-arrow');
+      body.classList.toggle('open');
+      arrow.classList.toggle('open');
+    }
+
     async function sendRequest() {
       const prompt = document.getElementById('prompt').value.trim();
       if (!prompt) return alert('Enter a prompt first.');
 
       document.getElementById('loading').style.display = 'block';
+      document.getElementById('done-indicator').style.display = 'none';
       document.getElementById('response-box').style.display = 'none';
 
       const res = await fetch('/chat', {
@@ -141,41 +138,28 @@ HTML = """
 
       if (data.error) {
         document.getElementById('response-box').style.display = 'block';
-        document.getElementById('response-box').textContent = '❌ Error: ' + data.error;
+        document.getElementById('response-body').textContent = '❌ Error: ' + data.error;
+        document.getElementById('response-body').classList.add('open');
+        document.getElementById('response-arrow').classList.add('open');
         return;
       }
 
+      // Show response in collapsible box
       document.getElementById('response-box').style.display = 'block';
-      document.getElementById('response-box').textContent = data.reply;
+      document.getElementById('response-body').textContent = data.reply;
+      document.getElementById('response-body').classList.remove('open');
+      document.getElementById('response-arrow').classList.remove('open');
+
+      // Show green checkmark
+      document.getElementById('done-indicator').style.display = 'inline';
+
+      // Auto-hide checkmark after 3 seconds
+      setTimeout(() => {
+        document.getElementById('done-indicator').style.display = 'none';
+      }, 3000);
 
       // Update stats
       document.getElementById('s-requests').textContent = data.stats.total_requests;
-      document.getElementById('s-tokens').textContent = (data.stats.total_tokens / 1e6).toFixed(2) + 'M';
-      document.getElementById('s-cost').textContent = '$' + data.stats.total_cost_usd.toFixed(4);
-      document.getElementById('s-energy').textContent = (data.stats.total_energy_kwh * 1000).toFixed(4) + ' Wh';
-
-      const cpm = data.stats.cost_per_million;
-      document.getElementById('s-cpm').textContent = cpm ? '$' + cpm.toFixed(4) : '—';
-
-      if (cpm) {
-        const savings = (((5.00 - cpm) / 5.00) * 100).toFixed(1);
-        document.getElementById('s-savings').textContent = savings + '% cheaper';
-        document.getElementById('s-savings').style.color = savings > 0 ? '#4caf50' : '#f44336';
-      }
-
-      // Add to history
-      const hist = document.getElementById('history');
-      const row = document.createElement('div');
-      row.className = 'history-row';
-      row.innerHTML = `
-        <strong>#${data.stats.total_requests}</strong>
-        <span class="pill orange">${data.request.prompt_tokens} prompt tkns</span>
-        <span class="pill orange">${data.request.completion_tokens} completion tkns</span>
-        <span class="pill green">$${data.request.cost_usd ? data.request.cost_usd.toFixed(6) : 'N/A'}</span>
-        <span class="pill green">${data.request.energy_kwh ? (data.request.energy_kwh * 1e6).toFixed(2) + ' mWh' : 'N/A'}</span>
-        <br/><span style="color:#666; padding-left:4px">${prompt.substring(0, 80)}${prompt.length > 80 ? '...' : ''}</span>
-      `;
-      hist.prepend(row);
 
       document.getElementById('prompt').value = '';
     }
@@ -227,7 +211,6 @@ def chat():
             messages=messages,
             seed=secrets.randbits(31),           # Random seed = no cached result possible
             temperature=0.7 + (secrets.randbits(8) / 1000),  # Slight jitter to bust any cache
-            max_tokens=1024,
             extra_headers={
                 "X-No-Cache": "true",
                 "Cache-Control": "no-store, no-cache, must-revalidate",
@@ -330,10 +313,10 @@ def reset_stats():
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     print(f"""
-╔══════════════════════════════════════════════╗
-║   Neuralwatt Zero-Cache Tester               ║
-║   Model: {MODEL:<35} ║
-║   Running at: http://localhost:{PORT}           ║
-╚══════════════════════════════════════════════╝
++{'='*42}+
+|   Neuralwatt Zero-Cache Tester               |
+|   Model: {MODEL:<35} |
+|   Running at: http://localhost:{PORT}           |
++{'='*42}+
     """)
     app.run(port=PORT, debug=True)
