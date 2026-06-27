@@ -227,7 +227,6 @@ def chat():
             messages=messages,
             seed=secrets.randbits(31),           # Random seed = no cached result possible
             temperature=0.7 + (secrets.randbits(8) / 1000),  # Slight jitter to bust any cache
-            max_tokens=1024,
             extra_headers={
                 "X-No-Cache": "true",
                 "Cache-Control": "no-store, no-cache, must-revalidate",
