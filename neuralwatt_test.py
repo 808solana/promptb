@@ -23,7 +23,7 @@ from flask import Flask, request, jsonify, render_template_string, make_response
 from openai import OpenAI
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-NEURALWATT_API_KEY = "sk-02026b28fd853228f52756d9372255d1a4d522f0e1c2b2cde2d17d380f434389"
+NEURALWATT_API_KEY = "sk-478b6720e8dd77d9e5b60d6cde17398cf3edfac6b9b41fc35a5aa71f914d14a8"
 NEURALWATT_BASE_URL = "https://api.neuralwatt.com/v1"  # update if different
 MODEL = "glm-5.2"
 PORT = 3000
