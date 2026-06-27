@@ -35,8 +35,16 @@ live, sequential run itself.
 
 ## The prompts
 
-- `promptb.json` — **100** heavyweight "build a complete X" coding tasks
-  (e.g. Node.js real-time auction system, Go SQL-executing server), ~174 chars each.
+- `prompts_agent2.json` — **100** heavyweight "build a complete X" coding tasks
+  (e.g. Python columnar query engine, Go distributed task framework). Renamed from the
+  earlier `promptb.json`.
+- Run in **5 groups of 20** prompts, in file order, one at a time.
+
+## UI signal
+
+The newest UI shows a pulsing green **"DONE — READY FOR THE NEXT PROMPT"** banner after
+each successful response — that's the cue to send the next prompt. The textarea also
+clears and the **Total Requests** counter increments on success.
 
 ## Environment
 

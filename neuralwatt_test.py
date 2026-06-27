@@ -23,7 +23,7 @@ from flask import Flask, request, jsonify, render_template_string, make_response
 from openai import OpenAI
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-NEURALWATT_API_KEY = "sk-02026b28fd853228f52756d9372255d1a4d522f0e1c2b2cde2d17d380f434389"
+NEURALWATT_API_KEY = "sk-478b6720e8dd77d9e5b60d6cde17398cf3edfac6b9b41fc35a5aa71f914d14a8"
 NEURALWATT_BASE_URL = "https://api.neuralwatt.com/v1"  # update if different
 MODEL = "glm-5.2"
 PORT = 3000
@@ -68,6 +68,9 @@ HTML = """
     button { background: #ff6b35; color: white; border: none; padding: 10px 24px; cursor: pointer; font-size: 14px; }
     button:hover { background: #e55a25; }
     .done-indicator { display: none; color: #4caf50; font-size: 20px; }
+    .done-banner { display: none; margin-top: 12px; padding: 14px 20px; background: linear-gradient(135deg, #1b5e20, #2e7d32); border: 2px solid #4caf50; border-radius: 8px; text-align: center; font-weight: bold; font-size: 18px; color: #c8e6c9; letter-spacing: 1px; box-shadow: 0 0 20px rgba(76, 175, 80, 0.3); animation: pulse-glow 2s ease-in-out infinite; }
+    .done-banner .check { font-size: 28px; display: block; margin-bottom: 4px; }
+    @keyframes pulse-glow { 0%, 100% { box-shadow: 0 0 20px rgba(76, 175, 80, 0.3); } 50% { box-shadow: 0 0 40px rgba(76, 175, 80, 0.6); } }
     .response { background: #1a1a1a; border: 1px solid #333; margin-top: 16px; font-size: 13px; overflow: hidden; }
     .response-header { display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; cursor: pointer; user-select: none; }
     .response-header:hover { background: #222; }
@@ -84,16 +87,20 @@ HTML = """
 </head>
 <body>
   <h1>⚡ Neuralwatt Zero-Cache Tester</h1>
-  <p style="color:#888; font-size:13px;">Every request uses fresh context — no caching. This gives you worst-case energy cost per million tokens.</p>
 
   <h2>SEND A REQUEST</h2>
   <textarea id="prompt" placeholder="Type your prompt here..."></textarea>
   <br/>
   <div class="btn-row">
-    <button onclick="sendRequest()">Send Request →</button>
+    <button type="button" onclick="sendRequest()">Send Request →</button>
     <span class="done-indicator" id="done-indicator">&#10003;</span>
   </div>
   <div id="loading">⏳ Waiting for response...</div>
+
+  <div id="done-banner" class="done-banner">
+    <span class="check">&#10003;</span>
+    DONE — READY FOR THE NEXT PROMPT
+  </div>
 
   <div id="response-box" class="response" style="display:none">
     <div class="response-header" onclick="toggleResponse()">
@@ -123,8 +130,10 @@ HTML = """
       const prompt = document.getElementById('prompt').value.trim();
       if (!prompt) return alert('Enter a prompt first.');
 
+      // Hide done states when starting a new request
       document.getElementById('loading').style.display = 'block';
       document.getElementById('done-indicator').style.display = 'none';
+      document.getElementById('done-banner').style.display = 'none';
       document.getElementById('response-box').style.display = 'none';
 
       const res = await fetch('/chat', {
@@ -150,13 +159,9 @@ HTML = """
       document.getElementById('response-body').classList.remove('open');
       document.getElementById('response-arrow').classList.remove('open');
 
-      // Show green checkmark
+      // Show done checkmark + prominent banner — stays until next request
       document.getElementById('done-indicator').style.display = 'inline';
-
-      // Auto-hide checkmark after 3 seconds
-      setTimeout(() => {
-        document.getElementById('done-indicator').style.display = 'none';
-      }, 3000);
+      document.getElementById('done-banner').style.display = 'block';
 
       // Update stats
       document.getElementById('s-requests').textContent = data.stats.total_requests;
@@ -319,4 +324,4 @@ if __name__ == "__main__":
 |   Running at: http://localhost:{PORT}           |
 +{'='*42}+
     """)
-    app.run(port=PORT, debug=True)
+    app.run(port=PORT, debug=False)
