@@ -54,4 +54,24 @@ clears and the **Total Requests** counter increments on success.
 
 ## Run log
 
-- _(to be filled as runs happen)_
+### Run 1 — full 100-prompt sweep (`prompts_agent2.json`, 5 groups of 20)
+
+All 100 prompts pasted sequentially through the live UI, one at a time, tokens uncapped,
+caching off. Server-side session stats (authoritative; in-memory, reset on restart):
+
+| Metric | Value |
+| --- | --- |
+| Successful requests | **94 / 100** (6 skipped after repeated 429/524 errors) |
+| Total tokens | 672,448 (completion 663,959 + prompt 8,489) |
+| Total cost | **$0.068378** |
+| Energy consumed | 0.013676 kWh (~13.68 Wh) |
+| **Effective cost / 1M tokens** | **~$0.10** |
+| vs $5.00/M baseline | ~98% cheaper |
+
+Per-group success (by Total Requests counter): G1 19/20, G2 16/20, G3 19/20, G4 20/20,
+G5 20/20.
+
+Notes:
+- The API returns `429` (rate limit) and `524` (Cloudflare timeout) under load with these
+  long, uncapped completions; a single retry usually clears it, otherwise the prompt is skipped.
+- Each heavy prompt takes ~1–7 min uncapped, so a full sweep runs for hours.
