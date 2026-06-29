@@ -46,6 +46,28 @@ The newest UI shows a pulsing green **"DONE — READY FOR THE NEXT PROMPT"** ban
 each successful response — that's the cue to send the next prompt. The textarea also
 clears and the **Total Requests** counter increments on success.
 
+## Proxy (`proxy.py`) — Cursor timeout debugging
+
+A separate proxy (port 4000) re-aliases Neuralwatt model slugs so Cursor can use
+them, tracks per-key usage, and forwards to Neuralwatt. It was the suspected cause of
+"very long timeout" errors in Cursor. Findings + fixes:
+
+- **Confirmed bug:** the original `requests.post(..., timeout=120)` chopped every long
+  generation at 120s (`504`). Reproduced exactly. Fixed: connect-only timeout, **no read
+  timeout** (`timeout=(15, None)`), so the proxy never cuts a long call.
+- **Fixed** the API-key line (`os.getenv("NEURALWATT_API_KEY", <key>)` — the original
+  passed the key as the env-var *name*, so it silently fell back to a placeholder).
+- **Streaming now passes upstream bytes through verbatim** (no `iter_lines` reassembly),
+  flushed immediately with anti-buffering headers; `stream_options.include_usage` is
+  requested so usage is still tracked. Measured TTFT ~0.6–1s through the proxy.
+- **Removed `debug=True`; runs threaded.** Production: `gunicorn -k gevent -w 4
+  --timeout 0 -b 0.0.0.0:4000 proxy:app`.
+- **Key takeaway:** even with a perfect proxy, Neuralwatt's *upstream* gateway cuts
+  **non-streamed** requests at ~100s. So **stream end-to-end** for long agent turns —
+  streaming works flawlessly; non-streaming long calls fail upstream regardless of the
+  proxy. Also ensure the cloud host in front does not buffer SSE or impose a max-duration
+  shorter than your longest call.
+
 ## Environment
 
 - Single-file Flask app. Python 3.12. Deps: `flask`, `requests`, `openai`.
