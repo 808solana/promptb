@@ -213,13 +213,25 @@ def chat_completions():
             )
 
         # ── NON-STREAMING ──────────────────────────────────────────────────
+        # NOTE: For long generations, prefer streaming. Neuralwatt's upstream
+        # gateway cuts non-streamed requests at ~100s, so a long non-streamed
+        # call can fail upstream no matter what this proxy does.
         resp = requests.post(
             f"{NEURALWATT_BASE_URL}/chat/completions",
             headers=headers,
             json=body,
             timeout=UPSTREAM_TIMEOUT,
         )
-        data = resp.json()
+        try:
+            data = resp.json()
+        except ValueError:
+            # Upstream returned non-JSON (e.g. a gateway timeout/HTML page or an
+            # empty body). Pass it through verbatim instead of masking it as a 500.
+            return Response(
+                resp.content,
+                status=resp.status_code,
+                content_type=resp.headers.get("content-type", "text/plain"),
+            )
         usage = data.get("usage", {}) or {}
         prompt_tokens = usage.get("prompt_tokens", 0)
         completion_tokens = usage.get("completion_tokens", 0)
