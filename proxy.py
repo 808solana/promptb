@@ -206,9 +206,10 @@ def chat_completions():
                 stream_with_context(generate()),
                 content_type="text/event-stream",
                 headers={
-                    "Cache-Control": "no-cache",
                     "Connection": "keep-alive",
-                    "X-Accel-Buffering": "no",  # disable nginx proxy buffering
+                    # X-Accel-Buffering controls response *buffering* (needed so SSE
+                    # streams instead of stalling) — it is NOT a caching directive.
+                    "X-Accel-Buffering": "no",
                 },
             )
 
