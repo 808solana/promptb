@@ -21,10 +21,13 @@ What changed vs the original (the timeout/"chop" fixes):
 - Rate-limit-aware retry: on 429/transient errors the proxy waits (honoring
   Retry-After) and retries, so bursts from multiple users become higher latency
   instead of hard failures. This RESPECTS the limit; it does not raise the ceiling.
-- Multi-account pool: set NEURALWATT_API_KEYS to several PAID account keys
+- Multi-account ring: set NEURALWATT_API_KEYS to several PAID account keys
   (comma-separated). Each customer sticks to one primary account (isolation +
-  prompt-cache locality) and fails over to the others if theirs is rate-limited or
-  out of budget. See /admin/accounts for per-account load/spend.
+  prompt-cache locality) and cascades around the ring to the others if theirs is
+  rate-limited or out of budget. A rate-limited account is put into COOLDOWN and
+  skipped until it recovers, so it gets a rest while the ring carries traffic — by
+  the time the ring loops back, it's ready. See /admin/accounts for per-account
+  load/spend and current cooldowns.
 
 Setup:
     pip install flask requests
@@ -42,6 +45,7 @@ import json
 import time
 import zlib
 import random
+import threading
 import requests
 from flask import Flask, request, jsonify, Response, stream_with_context
 from datetime import datetime
@@ -108,6 +112,25 @@ MAX_BACKOFF = float(os.getenv("PROXY_MAX_BACKOFF", "30"))          # seconds cap
 RETRY_STATUSES = {429, 500, 502, 503, 504}       # rate-limited/transient -> retry/failover
 BUDGET_STATUSES = {401, 402, 403}                # auth/budget exhausted -> drop that account
 
+# ── COOLDOWN / CIRCUIT BREAKER ────────────────────────────────────────────────
+# When an account is rate-limited we mark it "cooling down" and skip it for other
+# requests until it recovers — this is the ring's cooldown so a hot account gets a
+# rest while the others take traffic.
+ACCOUNT_COOLDOWN = float(os.getenv("PROXY_ACCOUNT_COOLDOWN", "3"))   # after a 429
+BUDGET_COOLDOWN = float(os.getenv("PROXY_BUDGET_COOLDOWN", "300"))   # after auth/budget err
+_cooldowns = {}                 # upstream_key -> epoch time it's cooling-down until
+_cooldown_lock = threading.Lock()
+
+
+def _cooldown_remaining(key):
+    with _cooldown_lock:
+        return max(0.0, _cooldowns.get(key, 0.0) - time.time())
+
+
+def _set_cooldown(key, seconds):
+    with _cooldown_lock:
+        _cooldowns[key] = max(_cooldowns.get(key, 0.0), time.time() + seconds)
+
 
 def _retry_delay(resp, attempt):
     """Seconds to wait before retry. Prefer the server's Retry-After header,
@@ -123,21 +146,28 @@ def _retry_delay(resp, attempt):
 
 
 def _post_upstream(key_order, body, stream):
-    """POST to Neuralwatt across a pool of accounts. Returns (response, key_used).
+    """POST to Neuralwatt across the account ring. Returns (response, key_used).
 
-    Strategy per request: try the customer's sticky primary account first, then fail
-    over to the other accounts (fast) if it is rate-limited/transient/out-of-budget.
-    If EVERY still-eligible account is rate-limited in a round, back off (honoring
-    Retry-After) and retry the eligible accounts, up to MAX_RETRIES rounds. Accounts
-    that return auth/budget errors are dropped from subsequent rounds.
-    For streaming, status is checked before any bytes are yielded.
+    Ring behavior: starting at the customer's sticky primary, try each account that
+    is NOT currently cooling down. On a 429 (or transient error), put that account
+    into cooldown (honoring Retry-After) and cascade to the next account. On an
+    auth/budget error, cool it down for much longer. If every account in the ring is
+    cooling down, wait for the soonest to recover, then go around again — up to
+    MAX_RETRIES rounds. For streaming, status is checked before any bytes are yielded.
     """
-    eligible = list(key_order)
     last_resp, last_key = None, key_order[-1]
     round_no = 0
     while True:
-        retryable = []
-        for key in eligible:
+        available = [k for k in key_order if _cooldown_remaining(k) <= 0]
+        if not available:
+            # Whole ring is cooling down — wait for the soonest account to come back.
+            if round_no >= MAX_RETRIES:
+                return last_resp, last_key
+            soonest = min((_cooldown_remaining(k) for k in key_order), default=1.0)
+            time.sleep(min(max(soonest, 0.1), MAX_BACKOFF))
+            round_no += 1
+            continue
+        for key in available:
             headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
             resp = requests.post(
                 f"{NEURALWATT_BASE_URL}/chat/completions",
@@ -150,12 +180,12 @@ def _post_upstream(key_order, body, stream):
             if stream:
                 resp.close()
             if code in RETRY_STATUSES:
-                retryable.append(key)                 # worth retrying after backoff
-            # BUDGET_STATUSES accounts are dropped (not added to retryable)
-        eligible = retryable
-        if not eligible or round_no >= MAX_RETRIES:
+                _set_cooldown(key, max(_retry_delay(resp, 0), ACCOUNT_COOLDOWN))
+            else:  # auth/budget exhausted -> long cooldown so we stop hitting it
+                _set_cooldown(key, BUDGET_COOLDOWN)
+        # Every available account failed this round; loop (cooldowns now set).
+        if round_no >= MAX_RETRIES:
             return last_resp, last_key
-        time.sleep(_retry_delay(last_resp, round_no))
         round_no += 1
 
 # ── MODEL MAP ─────────────────────────────────────────────────────────────────
@@ -435,6 +465,9 @@ def get_accounts():
     return jsonify({
         "pool_size": len(UPSTREAM_KEYS),
         "accounts": [_mask(k) for k in UPSTREAM_KEYS],
+        "cooldown_remaining_s": {
+            _mask(k): round(_cooldown_remaining(k), 1) for k in UPSTREAM_KEYS
+        },
         "per_account_usage": account_usage,
     })
 
