@@ -68,6 +68,17 @@ them, tracks per-key usage, and forwards to Neuralwatt. It was the suspected cau
   proxy. Also ensure the cloud host in front does not buffer SSE or impose a max-duration
   shorter than your longest call.
 
+## Cached tokens
+
+Neuralwatt reports cached prompt tokens OpenAI-style at
+`usage.prompt_tokens_details.cached_tokens` (a subset of `prompt_tokens`). Verified by
+probing a repeated large prompt: `cached_tokens: 3968` of `4030` prompt tokens.
+- The proxy's `track_usage` captures this (`total_cached_tokens`) and can bill cached
+  input at a separate rate (`YOUR_CACHED_INPUT_PRICE_PER_M`, default = input price).
+- **Caveat:** the *streaming* usage chunk omits `prompt_tokens_details`, so cached counts
+  are only available on **non-streaming** responses. Cursor streams, so cached tokens
+  won't populate for those calls.
+
 ## Environment
 
 - Single-file Flask app. Python 3.12. Deps: `flask`, `requests`, `openai`.

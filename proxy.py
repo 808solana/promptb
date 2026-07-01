@@ -66,8 +66,14 @@ MODEL_MAP = {
 }
 
 # ── YOUR PRICING (what you charge customers per million tokens) ───────────────
-YOUR_INPUT_PRICE_PER_M = 0.13   # $0.13 per million input tokens
+YOUR_INPUT_PRICE_PER_M = 0.13   # $0.13 per million (fresh/uncached) input tokens
 YOUR_OUTPUT_PRICE_PER_M = 0.23  # $0.23 per million output tokens
+# Cached input tokens (usage.prompt_tokens_details.cached_tokens) are usually much
+# cheaper upstream. Defaults to the normal input price so revenue is unchanged until
+# you set a lower cached rate (e.g. 0.013 for 10x cheaper).
+YOUR_CACHED_INPUT_PRICE_PER_M = float(
+    os.getenv("YOUR_CACHED_INPUT_PRICE_PER_M", str(YOUR_INPUT_PRICE_PER_M))
+)
 
 # ── FLASK APP ─────────────────────────────────────────────────────────────────
 app = Flask(__name__)
@@ -75,12 +81,20 @@ app = Flask(__name__)
 usage_tracker = {}
 
 
-def track_usage(api_key, model, prompt_tokens, completion_tokens, neuralwatt_cost):
-    """Track usage and calculate your revenue vs cost."""
+def track_usage(api_key, model, prompt_tokens, completion_tokens, neuralwatt_cost,
+                cached_tokens=0):
+    """Track usage and calculate your revenue vs cost.
+
+    cached_tokens comes from usage.prompt_tokens_details.cached_tokens (OpenAI-style)
+    and is a subset of prompt_tokens. Fresh (billable-at-full-rate) input tokens are
+    prompt_tokens - cached_tokens.
+    """
+    cached_tokens = cached_tokens or 0
     if api_key not in usage_tracker:
         usage_tracker[api_key] = {
             "total_requests": 0,
             "total_prompt_tokens": 0,
+            "total_cached_tokens": 0,
             "total_completion_tokens": 0,
             "total_tokens": 0,
             "neuralwatt_cost_usd": 0.0,
@@ -92,12 +106,15 @@ def track_usage(api_key, model, prompt_tokens, completion_tokens, neuralwatt_cos
     entry = usage_tracker[api_key]
     entry["total_requests"] += 1
     entry["total_prompt_tokens"] += prompt_tokens
+    entry["total_cached_tokens"] += cached_tokens
     entry["total_completion_tokens"] += completion_tokens
     entry["total_tokens"] += prompt_tokens + completion_tokens
     entry["neuralwatt_cost_usd"] += neuralwatt_cost or 0.0
 
+    fresh_input_tokens = max(prompt_tokens - cached_tokens, 0)
     your_revenue = (
-        (prompt_tokens / 1_000_000 * YOUR_INPUT_PRICE_PER_M)
+        (fresh_input_tokens / 1_000_000 * YOUR_INPUT_PRICE_PER_M)
+        + (cached_tokens / 1_000_000 * YOUR_CACHED_INPUT_PRICE_PER_M)
         + (completion_tokens / 1_000_000 * YOUR_OUTPUT_PRICE_PER_M)
     )
     entry["your_revenue_usd"] += your_revenue
@@ -134,6 +151,9 @@ def _extract_usage_from_sse_text(text, state):
             state["completion_tokens"] = usage.get(
                 "completion_tokens", state["completion_tokens"]
             )
+            details = usage.get("prompt_tokens_details") or {}
+            if "cached_tokens" in details:
+                state["cached_tokens"] = details.get("cached_tokens", state["cached_tokens"])
 
 
 # ── ROUTES ────────────────────────────────────────────────────────────────────
@@ -175,7 +195,11 @@ def chat_completions():
     try:
         if is_streaming:
             def generate():
-                state = {"buf": "", "prompt_tokens": 0, "completion_tokens": 0}
+                # NOTE: Neuralwatt's streaming usage chunk currently omits
+                # prompt_tokens_details, so cached_tokens stays 0 for streamed calls
+                # (cached counts are only reported on NON-streaming responses).
+                state = {"buf": "", "prompt_tokens": 0, "completion_tokens": 0,
+                         "cached_tokens": 0}
                 with requests.post(
                     f"{NEURALWATT_BASE_URL}/chat/completions",
                     headers=headers,
@@ -200,6 +224,7 @@ def chat_completions():
                     state["prompt_tokens"],
                     state["completion_tokens"],
                     neuralwatt_cost=None,
+                    cached_tokens=state["cached_tokens"],
                 )
 
             return Response(
@@ -236,13 +261,16 @@ def chat_completions():
         usage = data.get("usage", {}) or {}
         prompt_tokens = usage.get("prompt_tokens", 0)
         completion_tokens = usage.get("completion_tokens", 0)
+        # Option A: cached token count lives at usage.prompt_tokens_details.cached_tokens
+        cached_tokens = (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
 
         neuralwatt_cost = None
         cost_data = data.get("cost", {}) or {}
         if cost_data:
             neuralwatt_cost = cost_data.get("request_cost_usd")
 
-        track_usage(customer_api_key, requested_model, prompt_tokens, completion_tokens, neuralwatt_cost)
+        track_usage(customer_api_key, requested_model, prompt_tokens, completion_tokens,
+                    neuralwatt_cost, cached_tokens=cached_tokens)
         return jsonify(data), resp.status_code
 
     except requests.exceptions.ConnectTimeout:
