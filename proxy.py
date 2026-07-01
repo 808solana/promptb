@@ -21,6 +21,10 @@ What changed vs the original (the timeout/"chop" fixes):
 - Rate-limit-aware retry: on 429/transient errors the proxy waits (honoring
   Retry-After) and retries, so bursts from multiple users become higher latency
   instead of hard failures. This RESPECTS the limit; it does not raise the ceiling.
+- Multi-account pool: set NEURALWATT_API_KEYS to several PAID account keys
+  (comma-separated). Each customer sticks to one primary account (isolation +
+  prompt-cache locality) and fails over to the others if theirs is rate-limited or
+  out of budget. See /admin/accounts for per-account load/spend.
 
 Setup:
     pip install flask requests
@@ -36,6 +40,7 @@ In Cursor, set:
 import os
 import json
 import time
+import zlib
 import random
 import requests
 from flask import Flask, request, jsonify, Response, stream_with_context
@@ -47,8 +52,45 @@ NEURALWATT_API_KEY = os.getenv(
     "NEURALWATT_API_KEY",
     "sk-3cc59661cd4a84270dfbbd49783e4c440e97e16384826c3b85b191d5cb5d780c",
 )
+
+# ── UPSTREAM ACCOUNT POOL (multiple PAID accounts) ────────────────────────────
+# Put one or more PAID Neuralwatt keys here, comma-separated, via NEURALWATT_API_KEYS.
+# Falls back to the single NEURALWATT_API_KEY above. Each request is routed to one
+# account; a given customer sticks to the same account (isolation + prompt-cache
+# locality) and fails over to the others only when their account is rate-limited or
+# out of budget.
+_keys_env = os.getenv("NEURALWATT_API_KEYS", "").strip()
+UPSTREAM_KEYS = [k.strip() for k in _keys_env.split(",") if k.strip()] or [NEURALWATT_API_KEY]
+
+# Optional explicit pinning of a customer's proxy key -> account index (0-based).
+# e.g. CUSTOMER_ACCOUNT_MAP='{"user-1-key":0,"user-2-key":1,"user-3-key":2}'
+try:
+    CUSTOMER_ACCOUNT_MAP = json.loads(os.getenv("CUSTOMER_ACCOUNT_MAP", "{}"))
+except Exception:
+    CUSTOMER_ACCOUNT_MAP = {}
+
 NEURALWATT_BASE_URL = os.getenv("NEURALWATT_BASE_URL", "https://api.neuralwatt.com/v1")
 PORT = int(os.getenv("PORT", "4000"))
+
+
+def _mask(key):
+    return "acct:…" + key[-6:] if key else "acct:?"
+
+
+def _select_key_order(customer_api_key):
+    """Return the ordered list of upstream keys to try for this customer:
+    a sticky primary account (by explicit map, else stable hash) followed by the
+    others as failover targets."""
+    n = len(UPSTREAM_KEYS)
+    if n == 1:
+        return UPSTREAM_KEYS[:]
+    if customer_api_key in CUSTOMER_ACCOUNT_MAP:
+        idx = int(CUSTOMER_ACCOUNT_MAP[customer_api_key]) % n
+    else:
+        # zlib.crc32 is stable across processes (unlike hash()), so a customer always
+        # lands on the same primary account.
+        idx = zlib.crc32((customer_api_key or "").encode()) % n
+    return [UPSTREAM_KEYS[idx]] + UPSTREAM_KEYS[:idx] + UPSTREAM_KEYS[idx + 1:]
 
 # Only a CONNECT timeout (seconds). Read timeout is None => never cut off a long
 # generation. (connect, read) tuple per the requests library.
@@ -63,7 +105,8 @@ UPSTREAM_TIMEOUT = (CONNECT_TIMEOUT, None)
 # need a higher paid tier, not more retries.
 MAX_RETRIES = int(os.getenv("PROXY_MAX_RETRIES", "5"))
 MAX_BACKOFF = float(os.getenv("PROXY_MAX_BACKOFF", "30"))          # seconds cap
-RETRY_STATUSES = {429, 500, 502, 503, 504}
+RETRY_STATUSES = {429, 500, 502, 503, 504}       # rate-limited/transient -> retry/failover
+BUDGET_STATUSES = {401, 402, 403}                # auth/budget exhausted -> drop that account
 
 
 def _retry_delay(resp, attempt):
@@ -79,27 +122,41 @@ def _retry_delay(resp, attempt):
     return min((2 ** attempt) + random.random(), MAX_BACKOFF)
 
 
-def _post_upstream(headers, body, stream):
-    """POST to Neuralwatt with rate-limit-aware retry. Returns the requests.Response.
-    For streaming, status is checked before any bytes are yielded, so retries happen
-    before the client sees data."""
-    attempt = 0
+def _post_upstream(key_order, body, stream):
+    """POST to Neuralwatt across a pool of accounts. Returns (response, key_used).
+
+    Strategy per request: try the customer's sticky primary account first, then fail
+    over to the other accounts (fast) if it is rate-limited/transient/out-of-budget.
+    If EVERY still-eligible account is rate-limited in a round, back off (honoring
+    Retry-After) and retry the eligible accounts, up to MAX_RETRIES rounds. Accounts
+    that return auth/budget errors are dropped from subsequent rounds.
+    For streaming, status is checked before any bytes are yielded.
+    """
+    eligible = list(key_order)
+    last_resp, last_key = None, key_order[-1]
+    round_no = 0
     while True:
-        resp = requests.post(
-            f"{NEURALWATT_BASE_URL}/chat/completions",
-            headers=headers,
-            json=body,
-            stream=stream,
-            timeout=UPSTREAM_TIMEOUT,
-        )
-        if resp.status_code in RETRY_STATUSES and attempt < MAX_RETRIES:
-            delay = _retry_delay(resp, attempt)
+        retryable = []
+        for key in eligible:
+            headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+            resp = requests.post(
+                f"{NEURALWATT_BASE_URL}/chat/completions",
+                headers=headers, json=body, stream=stream, timeout=UPSTREAM_TIMEOUT,
+            )
+            code = resp.status_code
+            if code not in RETRY_STATUSES and code not in BUDGET_STATUSES:
+                return resp, key                      # success (or non-retryable 4xx)
+            last_resp, last_key = resp, key
             if stream:
                 resp.close()
-            time.sleep(delay)
-            attempt += 1
-            continue
-        return resp
+            if code in RETRY_STATUSES:
+                retryable.append(key)                 # worth retrying after backoff
+            # BUDGET_STATUSES accounts are dropped (not added to retryable)
+        eligible = retryable
+        if not eligible or round_no >= MAX_RETRIES:
+            return last_resp, last_key
+        time.sleep(_retry_delay(last_resp, round_no))
+        round_no += 1
 
 # ── MODEL MAP ─────────────────────────────────────────────────────────────────
 # Left  = what YOUR customers use (the slug they put in Cursor)
@@ -130,6 +187,18 @@ YOUR_CACHED_INPUT_PRICE_PER_M = float(
 app = Flask(__name__)
 
 usage_tracker = {}
+account_usage = {}   # per upstream account (masked): which account served how much
+
+
+def track_account(upstream_key, prompt_tokens, completion_tokens, neuralwatt_cost):
+    """Track load/spend per upstream (paid) account so you can watch each one."""
+    name = _mask(upstream_key)
+    if name not in account_usage:
+        account_usage[name] = {"requests": 0, "total_tokens": 0, "neuralwatt_cost_usd": 0.0}
+    a = account_usage[name]
+    a["requests"] += 1
+    a["total_tokens"] += (prompt_tokens or 0) + (completion_tokens or 0)
+    a["neuralwatt_cost_usd"] += neuralwatt_cost or 0.0
 
 
 def track_usage(api_key, model, prompt_tokens, completion_tokens, neuralwatt_cost,
@@ -230,10 +299,8 @@ def chat_completions():
     requested_model = body.get("model", "glm-5.2")
     body["model"] = MODEL_MAP.get(requested_model, requested_model)
 
-    headers = {
-        "Authorization": f"Bearer {NEURALWATT_API_KEY}",
-        "Content-Type": "application/json",
-    }
+    # Sticky primary account for this customer + failover order across the pool.
+    key_order = _select_key_order(customer_api_key)
 
     is_streaming = bool(body.get("stream", False))
 
@@ -251,8 +318,8 @@ def chat_completions():
                 # (cached counts are only reported on NON-streaming responses).
                 state = {"buf": "", "prompt_tokens": 0, "completion_tokens": 0,
                          "cached_tokens": 0}
-                # Retry on 429/transient BEFORE yielding any bytes to the client.
-                r = _post_upstream(headers, body, stream=True)
+                # Sticky account + failover + retry BEFORE yielding any bytes.
+                r, used_key = _post_upstream(key_order, body, stream=True)
                 with r:
                     if r.status_code >= 400:
                         # Retries exhausted or hard error: surface it as one SSE event
@@ -281,6 +348,8 @@ def chat_completions():
                     neuralwatt_cost=None,
                     cached_tokens=state["cached_tokens"],
                 )
+                track_account(used_key, state["prompt_tokens"],
+                              state["completion_tokens"], None)
 
             return Response(
                 stream_with_context(generate()),
@@ -297,8 +366,8 @@ def chat_completions():
         # NOTE: For long generations, prefer streaming. Neuralwatt's upstream
         # gateway cuts non-streamed requests at ~100s, so a long non-streamed
         # call can fail upstream no matter what this proxy does.
-        # Rate-limit-aware retry (429/transient) with Retry-After backoff.
-        resp = _post_upstream(headers, body, stream=False)
+        # Sticky account + failover + rate-limit-aware retry.
+        resp, used_key = _post_upstream(key_order, body, stream=False)
         try:
             data = resp.json()
         except ValueError:
@@ -322,6 +391,7 @@ def chat_completions():
 
         track_usage(customer_api_key, requested_model, prompt_tokens, completion_tokens,
                     neuralwatt_cost, cached_tokens=cached_tokens)
+        track_account(used_key, prompt_tokens, completion_tokens, neuralwatt_cost)
         return jsonify(data), resp.status_code
 
     except requests.exceptions.ConnectTimeout:
@@ -359,9 +429,20 @@ def get_summary():
     })
 
 
+@app.route("/admin/accounts", methods=["GET"])
+def get_accounts():
+    """Show the upstream paid-account pool and per-account load/spend."""
+    return jsonify({
+        "pool_size": len(UPSTREAM_KEYS),
+        "accounts": [_mask(k) for k in UPSTREAM_KEYS],
+        "per_account_usage": account_usage,
+    })
+
+
 @app.route("/admin/reset", methods=["POST"])
 def reset_usage():
     usage_tracker.clear()
+    account_usage.clear()
     return jsonify({"status": "reset"})
 
 
