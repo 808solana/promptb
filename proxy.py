@@ -18,6 +18,9 @@ What changed vs the original (the timeout/"chop" fixes):
 - `stream_options.include_usage` is requested so usage is captured on streamed calls.
 - `debug=True` removed; dev server runs threaded. Use gunicorn/uvicorn in production
   (see the run notes at the bottom).
+- Rate-limit-aware retry: on 429/transient errors the proxy waits (honoring
+  Retry-After) and retries, so bursts from multiple users become higher latency
+  instead of hard failures. This RESPECTS the limit; it does not raise the ceiling.
 
 Setup:
     pip install flask requests
@@ -32,6 +35,8 @@ In Cursor, set:
 
 import os
 import json
+import time
+import random
 import requests
 from flask import Flask, request, jsonify, Response, stream_with_context
 from datetime import datetime
@@ -49,6 +54,52 @@ PORT = int(os.getenv("PORT", "4000"))
 # generation. (connect, read) tuple per the requests library.
 CONNECT_TIMEOUT = float(os.getenv("PROXY_CONNECT_TIMEOUT", "15"))
 UPSTREAM_TIMEOUT = (CONNECT_TIMEOUT, None)
+
+# ── RATE-LIMIT RETRY ──────────────────────────────────────────────────────────
+# This RESPECTS the upstream rate limit (it does not raise your throughput ceiling).
+# On 429 (or a transient gateway error) we wait — honoring Retry-After when present —
+# and retry, so bursts from multiple users degrade into slightly-higher latency
+# instead of hard failures. If demand exceeds the account limit consistently, you
+# need a higher paid tier, not more retries.
+MAX_RETRIES = int(os.getenv("PROXY_MAX_RETRIES", "5"))
+MAX_BACKOFF = float(os.getenv("PROXY_MAX_BACKOFF", "30"))          # seconds cap
+RETRY_STATUSES = {429, 500, 502, 503, 504}
+
+
+def _retry_delay(resp, attempt):
+    """Seconds to wait before retry. Prefer the server's Retry-After header,
+    else exponential backoff with jitter, capped at MAX_BACKOFF."""
+    if resp is not None:
+        ra = resp.headers.get("Retry-After")
+        if ra:
+            try:
+                return min(float(ra), MAX_BACKOFF)
+            except ValueError:
+                pass
+    return min((2 ** attempt) + random.random(), MAX_BACKOFF)
+
+
+def _post_upstream(headers, body, stream):
+    """POST to Neuralwatt with rate-limit-aware retry. Returns the requests.Response.
+    For streaming, status is checked before any bytes are yielded, so retries happen
+    before the client sees data."""
+    attempt = 0
+    while True:
+        resp = requests.post(
+            f"{NEURALWATT_BASE_URL}/chat/completions",
+            headers=headers,
+            json=body,
+            stream=stream,
+            timeout=UPSTREAM_TIMEOUT,
+        )
+        if resp.status_code in RETRY_STATUSES and attempt < MAX_RETRIES:
+            delay = _retry_delay(resp, attempt)
+            if stream:
+                resp.close()
+            time.sleep(delay)
+            attempt += 1
+            continue
+        return resp
 
 # ── MODEL MAP ─────────────────────────────────────────────────────────────────
 # Left  = what YOUR customers use (the slug they put in Cursor)
@@ -200,13 +251,17 @@ def chat_completions():
                 # (cached counts are only reported on NON-streaming responses).
                 state = {"buf": "", "prompt_tokens": 0, "completion_tokens": 0,
                          "cached_tokens": 0}
-                with requests.post(
-                    f"{NEURALWATT_BASE_URL}/chat/completions",
-                    headers=headers,
-                    json=body,
-                    stream=True,
-                    timeout=UPSTREAM_TIMEOUT,
-                ) as r:
+                # Retry on 429/transient BEFORE yielding any bytes to the client.
+                r = _post_upstream(headers, body, stream=True)
+                with r:
+                    if r.status_code >= 400:
+                        # Retries exhausted or hard error: surface it as one SSE event
+                        # so the client sees a clean message instead of hanging.
+                        err = r.content.decode("utf-8", "replace")[:500]
+                        yield ("data: " + json.dumps(
+                            {"error": err or f"upstream {r.status_code}",
+                             "status": r.status_code}) + "\n\n").encode()
+                        return
                     # Pass upstream bytes through verbatim; never reassemble/mangle.
                     for chunk in r.iter_content(chunk_size=None):
                         if not chunk:
@@ -242,12 +297,8 @@ def chat_completions():
         # NOTE: For long generations, prefer streaming. Neuralwatt's upstream
         # gateway cuts non-streamed requests at ~100s, so a long non-streamed
         # call can fail upstream no matter what this proxy does.
-        resp = requests.post(
-            f"{NEURALWATT_BASE_URL}/chat/completions",
-            headers=headers,
-            json=body,
-            timeout=UPSTREAM_TIMEOUT,
-        )
+        # Rate-limit-aware retry (429/transient) with Retry-After backoff.
+        resp = _post_upstream(headers, body, stream=False)
         try:
             data = resp.json()
         except ValueError:
